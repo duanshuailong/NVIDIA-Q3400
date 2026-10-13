@@ -1,0 +1,9 @@
+# 固件/镜像不入库，从网盘下载（见 packages/README.md）
+packages/*
+!packages/README.md
+
+
+# 真实密码相关（本地使用，不入库）
+secrets.yml
+
+.DS_Store

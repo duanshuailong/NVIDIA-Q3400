@@ -1,0 +1,43 @@
+---
+# 升级完成后：删除 bootstrap 装的 SSH 公钥，回到纯密码登录
+# 用法: ansible-playbook playbooks/99-remove-key.yml
+#   指定几台: -l 192.168.1.70
+#
+# 注意: 删除后该机器只能用密码登录（group_vars 里 ansible_password 已配）。
+#       本 playbook 靠密码/现有连接执行，删 key 不影响本次已建立的会话。
+- name: Q3400 删除 SSH 公钥（回到密码登录）
+  hosts: q3400
+  gather_facts: false
+  vars:
+    # 本机公钥内容（用于精确匹配删除对应行）
+    pubkey_line: "{{ lookup('file', local_pubkey) | trim }}"
+  tasks:
+    - name: "检查 authorized_keys 是否存在"
+      ansible.builtin.raw: "test -f ~/.ssh/authorized_keys && echo exists || echo none"
+      register: ak
+      changed_when: false
+
+    - name: "从 authorized_keys 删除本机公钥"
+      when: "'exists' in ak.stdout"
+      # 用公钥的 key 主体（第二段 base64）精确匹配，避免误删其他 key
+      ansible.builtin.raw: >-
+        key='{{ pubkey_line.split(" ")[1] }}';
+        if [ -f ~/.ssh/authorized_keys ]; then
+          grep -vF "$key" ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp 2>/dev/null || true;
+          mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys;
+          chmod 600 ~/.ssh/authorized_keys;
+          echo removed;
+        fi
+      register: rm_out
+      changed_when: "'removed' in rm_out.stdout"
+
+    - name: "确认剩余公钥数量"
+      ansible.builtin.raw: "wc -l < ~/.ssh/authorized_keys 2>/dev/null || echo 0"
+      register: remain
+      changed_when: false
+
+    - name: "结果"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} 公钥已删除，剩余 authorized_keys 行数:
+          {{ remain.stdout | trim }}（之后仅密码登录）

@@ -1,0 +1,50 @@
+---
+# 推送脚本 + 固件 + NVOS 镜像到交换机 /host/tmp
+# 用法: ansible-playbook playbooks/10-stage.yml
+#   跳过大镜像只更新脚本: ansible-playbook playbooks/10-stage.yml -e push_images=false
+- name: Q3400 推送脚本与固件
+  hosts: q3400
+  gather_facts: false
+  become: true
+  vars:
+    push_images: true          # 是否推送 NVOS 大镜像（首次 true，后续更新脚本可 false）
+    push_firmware: true        # 是否推送 BIOS/CPLD 固件
+  tasks:
+    - name: 确保 /host/tmp 存在
+      ansible.builtin.raw: mkdir -p {{ remote_dir }}
+      changed_when: false
+
+    - name: 推送阶梯升级脚本
+      ansible.builtin.copy:
+        src: "{{ local_script }}"
+        dest: "{{ remote_script }}"
+        mode: "0755"
+
+    - name: 去除脚本可能的 CRLF
+      ansible.builtin.raw: sed -i 's/\r$//' {{ remote_script }}
+      changed_when: false
+
+    - name: 推送 BIOS/CPLD 固件
+      when: push_firmware | bool and firmware_files | length > 0
+      ansible.builtin.copy:
+        src: "{{ local_firmware_dir }}/{{ item }}"
+        dest: "{{ remote_dir }}/{{ item }}"
+        mode: "0644"
+      loop: "{{ firmware_files }}"
+
+    - name: 推送 NVOS 镜像（大文件，较慢）
+      when: push_images | bool and nvos_images | length > 0
+      ansible.builtin.copy:
+        src: "{{ local_images_dir }}/{{ item }}"
+        dest: "{{ remote_dir }}/{{ item }}"
+        mode: "0644"
+      loop: "{{ nvos_images }}"
+
+    - name: 列出已推送文件
+      ansible.builtin.raw: ls -lh {{ remote_dir }}/*.bin {{ remote_dir }}/*.cab {{ remote_dir }}/*.vme {{ remote_script }} 2>/dev/null
+      register: staged
+      changed_when: false
+
+    - name: 显示
+      ansible.builtin.debug:
+        var: staged.stdout_lines

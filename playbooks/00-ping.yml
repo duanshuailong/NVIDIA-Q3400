@@ -1,0 +1,27 @@
+---
+# 连通性 + 权限自检：确认能 SSH、能 sudo、能看到 nv 命令与当前版本
+# 用法: ansible-playbook playbooks/00-ping.yml
+- name: Q3400 连通性与环境自检
+  hosts: q3400
+  gather_facts: false
+  tasks:
+    - name: SSH 连通测试
+      ansible.builtin.raw: echo ok
+      changed_when: false
+
+    - name: 检查 nv 命令与当前 NVOS 版本
+      ansible.builtin.raw: nv show system 2>/dev/null | awk '/product-release/ {print $2; exit}'
+      register: nvos_ver
+      changed_when: false
+
+    - name: 检查是否可写 /host/tmp（需要 root）
+      become: true
+      ansible.builtin.raw: touch /host/tmp/.ansible_probe && rm -f /host/tmp/.ansible_probe && echo writable
+      register: writable
+      changed_when: false
+
+    - name: 汇总
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} | NVOS={{ nvos_ver.stdout | trim | default('未知') }}
+          | /host/tmp {{ 'possible' if 'writable' in writable.stdout else '不可写(检查 sudo)' }}

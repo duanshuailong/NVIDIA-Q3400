@@ -1,0 +1,16 @@
+---
+# 只读查看所有机器状态：当前版本、阶梯、已装分区镜像（不做任何改动）
+# 用法: ansible-playbook playbooks/30-status.yml
+- name: Q3400 批量状态查看
+  hosts: q3400
+  gather_facts: false
+  become: true
+  tasks:
+    - name: "运行 --status"
+      ansible.builtin.raw: "{{ remote_script }} --status 2>&1"
+      register: st
+      changed_when: false
+
+    - name: "显示"
+      ansible.builtin.debug:
+        var: st.stdout_lines

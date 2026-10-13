@@ -1,0 +1,50 @@
+---
+# ===== 连接 =====
+ansible_user: admin            # 交换机登录用户（NVOS 默认 admin）
+# 所有机器密码统一 admin：新机(有公钥,密码也可用) + 老机(仅密码) 通吃
+# 密码登录需 Mac 装 sshpass（见 README）
+ansible_password: "admin"          # SSH 登录密码
+ansible_become: true           # 升级需 root（写 /host、装固件、改 cron）
+ansible_become_method: sudo
+ansible_become_password: "admin"   # sudo 提权密码
+
+# bootstrap 时装的公钥（升级完成后用 99-remove-key.yml 删除，回到纯密码登录）
+local_pubkey: "~/.ssh/id_ed25519.pub"
+
+# ===== 本地文件（Mac 上，源；均在本项目目录内，随项目一起移动） =====
+# playbook_dir 是 playbooks/ 的绝对路径，/.. 回到项目根
+# 阶梯升级脚本
+local_script: "{{ playbook_dir }}/../scripts/q3400-upgrade-ladder.sh"
+# 指定版本切换脚本（可升可降/回退，供 50-set-version.yml 用）
+local_set_version_script: "{{ playbook_dir }}/../scripts/q3400-set-version.sh"
+# 固件 + 镜像统一放在 packages/（.cab / *.vme / *.bin 同目录）
+local_firmware_dir: "{{ playbook_dir }}/../packages"
+# NVOS 镜像目录（同上，10-stage 按文件名拷，同目录不冲突）
+local_images_dir: "{{ playbook_dir }}/../packages"
+
+# 要推送的 NVOS 镜像文件名（阶梯由这些决定；只放需要的版本）
+# 逐级：6077→7002→8008→1010 需要 7002/8008/1010
+# 跳级：只放 8008/1010 则 6077 直接跳 8008（能否跳取决于 NVOS）
+nvos_images:
+  - "nvosv25-02-7002amd64.bin"
+  - "nvos-amd64-25.02.8008.bin"
+  - "nvos-amd64-25.03.1010.bin"
+
+# BIOS/CPLD 固件（若目标机 BIOS/CPLD 已达标，可留空 [] 不推送）
+firmware_files:
+  - "0ACQF.cab"
+  - "burn.vme"
+  - "refresh.vme"
+
+# ===== 交换机上的目标路径（与脚本内一致，勿改） =====
+remote_dir: "/host/tmp"                       # 脚本 SRC，跨分区保留
+remote_script: "/host/tmp/q3400-upgrade-ladder.sh"
+remote_set_version_script: "/host/tmp/q3400-set-version.sh"
+
+# ===== 升级流程参数 =====
+# 一台机器最多几跳（BIOS+CPLD+NVOS 阶梯）。6077→1010 最多 3 段 NVOS + 2 段固件，留足余量
+max_iterations: 8
+# 每次执行一阶段后，等交换机重启恢复 SSH 的最长时间（秒）
+reboot_timeout: 900
+# 重启后延迟多久开始探测 SSH（秒）
+reboot_delay: 30

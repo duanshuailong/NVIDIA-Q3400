@@ -1,0 +1,62 @@
+---
+# 主升级编排：逐跳执行 BIOS→CPLD→NVOS 阶梯，每跳后等重启恢复，直到全部达标。
+# Ansible 从 Mac 驱动，天然跨 NVOS 分区（不依赖交换机 cron）。
+#
+# 用法:
+#   全部机器:      ansible-playbook playbooks/20-upgrade.yml
+#   指定某几台:    ansible-playbook playbooks/20-upgrade.yml -l leaf58,leaf59
+#   先推文件再升:  ansible-playbook playbooks/10-stage.yml && ansible-playbook playbooks/20-upgrade.yml
+#
+# 提示: 大镜像建议先用 10-stage.yml 推好，本 playbook 默认假设 /host/tmp 已有固件。
+- name: Q3400 阶梯升级编排
+  hosts: q3400
+  gather_facts: false
+  # 逐台完成再下一台，避免同时大量重启不好观察；想并行可删下一行（受 forks 限制）
+  serial: 1
+  tasks:
+    - name: "确认脚本已就位（未就位请先跑 10-stage.yml）"
+      become: true
+      ansible.builtin.raw: "test -f {{ remote_script }} && echo present || echo missing"
+      register: script_present
+      changed_when: false
+      failed_when: "'missing' in script_present.stdout"
+
+    - name: "升级前备份配置（含带外 eth0 IP）"
+      become: true
+      ansible.builtin.raw: "{{ remote_script }} --backup 2>&1 | tail -5"
+      register: backup_out
+      changed_when: false
+
+    - name: "备份结果"
+      ansible.builtin.debug:
+        var: backup_out.stdout_lines
+
+    - name: "初始化循环状态"
+      ansible.builtin.set_fact:
+        hop_done: false
+
+    - name: "逐跳升级直到全部达标（最多 {{ max_iterations }} 跳）"
+      ansible.builtin.include_tasks: tasks/one_hop.yml
+      loop: "{{ range(1, max_iterations | int + 1) | list }}"
+      loop_control:
+        loop_var: hop_index
+      when: not hop_done
+
+    - name: "最终验收 + 清理非法分区镜像"
+      when: hop_done
+      become: true
+      ansible.builtin.raw: "{{ remote_script }} --verify 2>&1 | tail -30"
+      register: verify_out
+      changed_when: false
+
+    - name: "验收结果"
+      when: hop_done
+      ansible.builtin.debug:
+        var: verify_out.stdout_lines
+
+    - name: "警告：达到最大跳数仍未完成"
+      when: not hop_done
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} 执行 {{ max_iterations }} 跳后仍未达标，
+          请登录检查: tail -50 /host/tmp/q3400-upgrade.log

@@ -1,0 +1,87 @@
+#!/usr/bin/env expect
+# 新交换机一次性初始化：处理首登强制改密码 + 安装 SSH 公钥（之后免密码）
+#
+# 用法:
+#   ./bootstrap-switch.exp <IP> <旧密码> <新密码> [公钥文件]
+#   例: ./bootstrap-switch.exp 192.168.1.58 admin 'NewPass@2026' ~/.ssh/id_ed25519.pub
+#
+# 说明:
+#   - 默认新机 admin/admin，首登会强制改密码，本脚本自动应答三次提示
+#   - 改完后把公钥追加到 authorized_keys，Ansible 之后就免密码
+#   - 提示词因 NVOS 版本略有差异，脚本用关键词模糊匹配（password/New/Retype）
+
+set timeout 60
+set ip       [lindex $argv 0]
+set oldpass  [lindex $argv 1]
+set newpass  [lindex $argv 2]
+set pubfile  [lindex $argv 3]
+
+if {$ip eq "" || $oldpass eq "" || $newpass eq ""} {
+    puts "用法: $argv0 <IP> <旧密码> <新密码> \[公钥文件\]"
+    exit 1
+}
+
+set user "admin"
+set pubkey ""
+if {$pubfile ne ""} {
+    if {[catch {set fh [open $pubfile r]} err]} {
+        puts "警告: 无法读取公钥文件 $pubfile，跳过装公钥"
+    } else {
+        set pubkey [string trim [read $fh]]
+        close $fh
+    }
+}
+
+# ---- 首次登录 + 改密码 ----
+spawn ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null $user@$ip
+
+expect {
+    -re "(?i)current.*password:|(?i)^password:|(?i)\[$user\]@.*password:" {
+        send "$oldpass\r"
+    }
+    -re "(?i)assword:" {
+        send "$oldpass\r"
+    }
+    timeout { puts "\n错误: 等待密码提示超时"; exit 2 }
+}
+
+# 首登后可能立即要求改密码，也可能直接进 shell
+expect {
+    -re "(?i)new password:" {
+        send "$newpass\r"
+        expect -re "(?i)retype.*password:|(?i)new password:"
+        send "$newpass\r"
+        # 改密后通常会断开或回到登录，等待收尾
+        expect {
+            -re "(?i)assword updated|successfully|assword:" { }
+            eof { }
+            timeout { }
+        }
+        puts "\n>>> 密码已修改为新密码"
+    }
+    -re "\\\$ |# |> " {
+        puts "\n>>> 未要求改密码（可能已初始化），已进入 shell"
+    }
+    timeout {
+        puts "\n注意: 未出现改密码提示，也未确认进入 shell，请手动核对"
+    }
+}
+
+# 若上一步断开了，用新密码重连并装公钥
+if {$pubkey ne ""} {
+    catch { close }
+    catch { wait }
+    puts ">>> 用新密码重连安装公钥..."
+    spawn ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null $user@$ip \
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$pubkey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo KEY_INSTALLED"
+    expect {
+        -re "(?i)assword:" { send "$newpass\r"; exp_continue }
+        "KEY_INSTALLED" { puts "\n>>> 公钥已安装，之后可免密码登录" }
+        eof { }
+        timeout { puts "\n警告: 安装公钥超时，请手动确认" }
+    }
+}
+
+catch { close }
+catch { wait }
+puts "\n完成: $ip"

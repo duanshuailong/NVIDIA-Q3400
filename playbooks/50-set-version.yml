@@ -1,0 +1,201 @@
+---
+# 指定版本切换（可升可降/回退）—— 忽略逐级阶梯，直达目标版本，
+# 重启进入目标后清理机内多余分区镜像，只保留目标版本。
+#
+# 与 20-upgrade.yml 的区别：
+#   - 20-upgrade：逐级阶梯升到最高版本
+#   - 本 playbook：直接切到你 -e target_version 指定的精确版本（能否一步到位取决于 NVOS）
+#
+# 机制（NVOS 双分区，跨一次重启完成）：
+#   1. 推 q3400-set-version.sh + 目标版本镜像到 /host/tmp
+#   2. 只读检测：当前已是目标 → 幂等跳过
+#   3. 安装目标镜像到 standby 分区并设 boot-next（--no-reboot，此步不重启）
+#   4. auto_reboot=true 才重启进目标；重启后校验“运行版本==目标”
+#   5. cleanup_partitions=true 时删除 standby（此时旧版本已落到 standby，可删）
+#      → uninstall 无参只删 standby，结果只剩目标版本，满足“只保留指定分区”
+#
+# *** 安全 ***
+#   - 默认 auto_reboot=false：只装到 standby、设好 boot-next，绝不擅自重启。
+#     确认后再加 -e auto_reboot=true 让它重启并清理。
+#   - 清理(cleanup)只在重启并校验通过后执行；auto_reboot=false 时不会清理。
+#   - 切分区后 Linux 层密码回默认，建议先跑 40-set-password.yml 写入 nv config 层。
+#
+# 用法：
+#   # ① 先只装到 standby、不重启（安全预置）：
+#   ansible-playbook playbooks/50-set-version.yml -e target_version=25.02.6077
+#
+#   # ② 确认后：重启进目标 + 重启后清理多余分区，只留目标：
+#   ansible-playbook playbooks/50-set-version.yml -e target_version=25.02.6077 \
+#       -e auto_reboot=true -e cleanup_partitions=true
+#
+#   # 只对某几台：  -l 192.0.2.93
+#   # 不清理（保留旧分区做回退保险）：  -e cleanup_partitions=false
+- name: Q3400 指定版本切换 + 分区清理
+  hosts: q3400
+  gather_facts: false
+  become: true
+  serial: 1                      # 逐台完成，避免同时重启不好观察
+  vars:
+    target_version: ""           # 必填：目标 NVOS 版本，如 25.02.6077
+    auto_reboot: false           # 安全开关：true 才重启进目标（默认只预置不重启）
+    cleanup_partitions: true     # 重启并校验通过后，删 standby 只留目标（需 auto_reboot=true 才会执行）
+    push_image: true             # 是否推送目标版本镜像（已 10-stage 推过可 false）
+  tasks:
+    - name: "校验已传入 target_version"
+      ansible.builtin.assert:
+        that:
+          - target_version | length > 0
+          - target_version is match('^[0-9]{2}\\.[0-9]{2}\\.[0-9]{3,5}$')
+        fail_msg: "必须用 -e target_version=25.02.6077 传入完整版本号（形如 NN.NN.NNNN）"
+        quiet: true
+
+    # --- 本地(Mac)定位目标版本镜像：文件名里版本用 . 或 - 分隔都能匹配 ---
+    - name: "本地定位目标版本镜像"
+      delegate_to: localhost
+      run_once: true
+      vars:
+        image_regex: "{{ target_version | regex_replace('\\.', '[.-]') }}"
+      ansible.builtin.set_fact:
+        matched_images: >-
+          {{ query('fileglob', local_images_dir + '/*.bin')
+             | map('basename') | select('search', image_regex) | list }}
+
+    - name: "校验恰好匹配到一个镜像"
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - matched_images | length == 1
+        fail_msg: >-
+          在 {{ local_images_dir }} 里匹配 {{ target_version }} 的镜像数={{ matched_images | length }}
+          （{{ matched_images | default([]) | join(', ') }}）。请确保该目录下有且仅有一个对应 .bin。
+        quiet: true
+
+    - name: "记录目标镜像文件名"
+      ansible.builtin.set_fact:
+        target_image: "{{ matched_images[0] }}"
+
+    # --- 推送脚本 + 目标镜像 ---
+    - name: "确保 /host/tmp 存在"
+      ansible.builtin.raw: "mkdir -p {{ remote_dir }}"
+      changed_when: false
+
+    - name: "推送指定版本切换脚本"
+      ansible.builtin.copy:
+        src: "{{ local_set_version_script }}"
+        dest: "{{ remote_set_version_script }}"
+        mode: "0755"
+
+    - name: "去除脚本可能的 CRLF"
+      ansible.builtin.raw: "sed -i 's/\r$//' {{ remote_set_version_script }}"
+      changed_when: false
+
+    - name: "推送目标版本镜像（大文件，较慢）"
+      when: push_image | bool
+      ansible.builtin.copy:
+        src: "{{ local_images_dir }}/{{ target_image }}"
+        dest: "{{ remote_dir }}/{{ target_image }}"
+        mode: "0644"
+
+    # --- 只读检测：是否已在目标版本 ---
+    - name: "只读检测当前状态（--check）"
+      ansible.builtin.raw: "{{ remote_set_version_script }} --version {{ target_version }} --check 2>&1"
+      register: check_out
+      changed_when: false
+
+    - name: "打印检测结果"
+      ansible.builtin.debug:
+        var: check_out.stdout_lines
+
+    - name: "标记是否已在目标版本"
+      ansible.builtin.set_fact:
+        already_on_target: "{{ '已在目标版本' in check_out.stdout }}"
+
+    # --- 安装到 standby（不重启，安全预置）---
+    - name: "安装目标版本到 standby 分区并设 boot-next（--no-reboot）"
+      when: not already_on_target
+      ansible.builtin.raw: "{{ remote_set_version_script }} --version {{ target_version }} --no-reboot >> /host/tmp/q3400-set-version.log 2>&1"
+      register: install_out
+      changed_when: true
+
+    - name: "已预置提示（未开 auto_reboot）"
+      when:
+        - not already_on_target
+        - not (auto_reboot | bool)
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ target_version }} 已安装到 standby 并设为 boot-next，
+          但未重启（auto_reboot=false）。确认后重跑并加 -e auto_reboot=true -e cleanup_partitions=true
+          即可重启进目标并清理多余分区。手动重启命令: nv action reboot system force
+
+    # =================== 以下仅在 auto_reboot=true 且需切换时执行 ===================
+    - name: "重启进入目标版本 + 校验 + 清理"
+      when:
+        - not already_on_target
+        - auto_reboot | bool
+      block:
+        - name: "触发重启（进入 boot-next 目标分区）"
+          # raw 触发重启后 SSH 断开，用 ignore 吞掉，交给随后的 wait_for_connection
+          ansible.builtin.raw: "nv action reboot system force"
+          register: reboot_job
+          ignore_errors: true
+          ignore_unreachable: true
+          changed_when: true
+
+        - name: "给重启留出断开时间"
+          ansible.builtin.pause:
+            seconds: "{{ reboot_delay }}"
+
+        - name: "等待交换机重启后 SSH 恢复"
+          ansible.builtin.wait_for_connection:
+            delay: "{{ reboot_delay }}"
+            timeout: "{{ reboot_timeout }}"
+
+        - name: "读取重启后运行的 NVOS 版本"
+          ansible.builtin.raw: "{{ remote_set_version_script }} --version {{ target_version }} --check 2>&1"
+          register: check_after
+          changed_when: false
+
+        - name: "打印重启后状态"
+          ansible.builtin.debug:
+            var: check_after.stdout_lines
+
+        - name: "校验：确实已运行目标版本，否则中止（不清理，防误删）"
+          ansible.builtin.assert:
+            that:
+              - "'已在目标版本' in check_after.stdout"
+            fail_msg: >-
+              {{ inventory_hostname }} 重启后未运行目标版本 {{ target_version }}，
+              终止并跳过分区清理。请登录检查: nv show system image
+            quiet: true
+
+        # --- 清理：删 standby（此时旧版本已落到 standby），只留目标 ---
+        - name: "清理多余分区镜像（uninstall 无参，只删 standby）"
+          when: cleanup_partitions | bool
+          # 无参 uninstall 只删非 boot-next 的 standby 分区；切勿加 files/force
+          ansible.builtin.raw: "nv action uninstall system image 2>&1"
+          register: uninstall_out
+          changed_when: true
+          # 若 standby 本就为空/无可删，返回非 0 也不算失败
+          failed_when: false
+
+        - name: "打印清理结果"
+          when: cleanup_partitions | bool
+          ansible.builtin.debug:
+            var: uninstall_out.stdout_lines
+
+        - name: "清理后分区状态（只读确认只剩目标）"
+          when: cleanup_partitions | bool
+          ansible.builtin.raw: "nv show system image 2>&1"
+          register: final_parts
+          changed_when: false
+
+        - name: "最终分区"
+          when: cleanup_partitions | bool
+          ansible.builtin.debug:
+            var: final_parts.stdout_lines
+
+    - name: "已在目标版本，跳过"
+      when: already_on_target
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} 当前已是 {{ target_version }}，无需切换。"

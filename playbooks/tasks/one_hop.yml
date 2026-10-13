@@ -1,0 +1,53 @@
+---
+# 单跳：执行一个升级阶段（BIOS 或 CPLD 或 一级 NVOS），若触发重启则等恢复
+# 依赖变量: remote_script, reboot_delay, reboot_timeout
+# 设置事实: hop_done (true=已全部达标，可结束循环)
+
+- name: "检测是否已全部达标"
+  become: true
+  ansible.builtin.raw: "{{ remote_script }} --check 2>/dev/null | tail -20"
+  register: check_out
+  changed_when: false
+
+- name: "标记完成状态"
+  ansible.builtin.set_fact:
+    hop_done: "{{ '已全部达标' in check_out.stdout }}"
+
+- name: "打印当前检测结果"
+  ansible.builtin.debug:
+    var: check_out.stdout_lines
+
+- name: "执行一阶段升级（--run，可能触发重启）"
+  when: not hop_done
+  become: true
+  # raw 不支持 async；--run 本身是同步的（脚本前台跑完一个阶段：安装 → nv action reboot）。
+  # 所以这里同步阻塞等它跑完：安装耗时几分钟由 ServerAliveInterval 保活，
+  # 真正触发重启时 SSH 断开 → 任务报错/unreachable，用下面两个 ignore 吞掉，
+  # 交给随后的 pause + wait_for_connection 等重启恢复。切忌后台化（会秒返回导致空转）。
+  ansible.builtin.raw: "{{ remote_script }} --run >> /host/tmp/q3400-upgrade.log 2>&1"
+  register: run_job
+  ignore_errors: true
+  ignore_unreachable: true
+
+- name: "给升级动作留出执行/触发重启的时间"
+  when: not hop_done
+  ansible.builtin.pause:
+    seconds: "{{ reboot_delay }}"
+
+- name: "等待交换机重启后 SSH 恢复"
+  when: not hop_done
+  ansible.builtin.wait_for_connection:
+    delay: "{{ reboot_delay }}"
+    timeout: "{{ reboot_timeout }}"
+
+- name: "恢复后读取当前版本"
+  when: not hop_done
+  become: true
+  ansible.builtin.raw: nv show system 2>/dev/null | awk '/product-release/ {print $2; exit}'
+  register: ver_after
+  changed_when: false
+
+- name: "本跳结果"
+  when: not hop_done
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} 本跳后 NVOS = {{ ver_after.stdout | trim }}"
