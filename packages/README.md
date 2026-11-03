@@ -6,8 +6,10 @@
 
 百度网盘：NVIDIA-Q3400
 
-- 链接：https://pan.baidu.com/s/1fN9AeE0i_C_QzQYRdrRxEQ?pwd=iava
-- 提取码：`iava`
+- 链接：https://pan.baidu.com/s/1Jrogy7mtHN9su3CAlt_XFQ?pwd=u5vd
+- 提取码：`u5vd`
+
+> 网盘中的镜像和固件仅供参考，不保证完整性和适用性。生产环境请以 NVIDIA 官方渠道获取的版本为准，使用前自行校验。
 
 下载后把文件直接放进本目录（`packages/`），不要放子目录以外的位置。
 
